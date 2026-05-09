@@ -214,6 +214,20 @@ async def handle_client(websocket, path):
                 elif action == "ping":
                     await websocket.send(json.dumps({"action": "pong"}))
 
+                elif action == "lan_info":
+                    if room and client_type == "host":
+                        motd = data.get("motd", "Minecraft Server")
+                        port = data.get("port", 25565)
+                        for guest_name, guest_ws in room.guests.items():
+                            try:
+                                await guest_ws.send(json.dumps({
+                                    "action": "lan_info",
+                                    "motd": motd,
+                                    "port": port
+                                }))
+                            except:
+                                pass
+
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"action": "error", "message": "Invalid JSON"}))
             except Exception as e:
