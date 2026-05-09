@@ -1,22 +1,17 @@
 """
-Hiroku Relay Server - WebSocket relay для обхода Symmetric NAT
-ВСЕ данные идут через WebSocket (один порт)
-Работает на Render Free Tier
+Hiroku Relay Server - WebSocket relay for bypassing Symmetric NAT
+All data goes through WebSocket (single port)
+Works on Render Free Tier
 """
 import asyncio
 import json
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 import websockets
-from websockets.frames import Frame
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -24,9 +19,9 @@ class Room:
     code: str
     host_name: str
     host_ws: Optional[websockets.WebSocketServerProtocol] = None
-    host_ws_queue: Optional[asyncio.Queue] = None
     guests: Dict[str, websockets.WebSocketServerProtocol] = field(default_factory=dict)
-    guest_ws_queues: Dict[str, asyncio.Queue] = field(default_factory=dict)
+    lan_motd: str = "Minecraft Server"
+    lan_port: int = 25565
 
 class RoomManager:
     def __init__(self):
@@ -35,12 +30,7 @@ class RoomManager:
     def create_room(self, code: str, host_name: str, host_ws) -> Optional[Room]:
         if code in self.rooms:
             return None
-        room = Room(
-            code=code, 
-            host_name=host_name, 
-            host_ws=host_ws,
-            host_ws_queue=asyncio.Queue()
-        )
+        room = Room(code=code, host_name=host_name, host_ws=host_ws)
         self.rooms[code] = room
         logger.info(f"Room created: {code} by {host_name}")
         return room
@@ -56,13 +46,6 @@ class RoomManager:
                     await guest_ws.send(json.dumps({"action": "room_closed"}))
                 except:
                     pass
-            room.guest_ws_queues.clear()
-            if room.host_ws_queue:
-                while not room.host_ws_queue.empty():
-                    try:
-                        room.host_ws_queue.get_nowait()
-                    except:
-                        break
             del self.rooms[code]
             logger.info(f"Room removed: {code}")
 
@@ -71,7 +54,6 @@ class RoomManager:
         if not room or not room.host_ws:
             return False
         room.guests[guest_name] = guest_ws
-        room.guest_ws_queues[guest_name] = asyncio.Queue()
         logger.info(f"Guest {guest_name} joined room {room_code}")
         return True
 
@@ -79,54 +61,37 @@ class RoomManager:
         room = self.rooms.get(room_code)
         if room and guest_name in room.guests:
             del room.guests[guest_name]
-            if guest_name in room.guest_ws_queues:
-                del room.guest_ws_queues[guest_name]
             logger.info(f"Guest {guest_name} left room {room_code}")
 
     def list_rooms(self) -> list:
         return [
-            {
-                "code": code,
-                "host_name": room.host_name,
-                "players": 1 + len(room.guests),
-                "max_players": 10
-            }
+            {"code": code, "host_name": room.host_name, "players": 1 + len(room.guests), "max_players": 10}
             for code, room in self.rooms.items()
             if room.host_ws
         ]
 
 room_manager = RoomManager()
 
-async def relay_game_data(ws, queue: asyncio.Queue, is_host: bool, room_code: str, client_name: str):
-    """Пересылка бинарных игровых данных через WebSocket"""
-    try:
-        while True:
-            data = await queue.get()
-            if data is None:
-                break
-            await ws.send(data)
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    except Exception as e:
-        logger.error(f"Relay error ({client_name}): {e}")
-
-async def handle_client(websocket, path):
-    """Обработка WebSocket соединений"""
+async def handle_client(websocket):
     client_type = None
     room_code = None
     client_name = None
     room = None
-    tasks = []
 
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                # Бинарные данные игры
-                if room and client_type == "host":
-                    for guest_name, guest_queue in room.guest_ws_queues.items():
-                        await guest_queue.put(message)
-                elif room and client_type == "guest" and room.host_ws_queue:
-                    await room.host_ws_queue.put(message)
+                if room and client_type == "host" and room.guests:
+                    for guest_ws in list(room.guests.values()):
+                        try:
+                            await guest_ws.send(message)
+                        except:
+                            pass
+                elif room and client_type == "guest" and room.host_ws:
+                    try:
+                        await room.host_ws.send(message)
+                    except:
+                        pass
                 continue
 
             try:
@@ -139,17 +104,10 @@ async def handle_client(websocket, path):
                     client_type = "host"
                     room = room_manager.create_room(room_code, client_name, websocket)
                     if room:
-                        await websocket.send(json.dumps({
-                            "action": "created",
-                            "code": room_code,
-                            "server_url": os.environ.get("SERVER_URL", "wss://localhost:8765")
-                        }))
+                        await websocket.send(json.dumps({"action": "created", "code": room_code}))
                         logger.info(f"Room {room_code} created")
                     else:
-                        await websocket.send(json.dumps({
-                            "action": "error",
-                            "message": "Room already exists"
-                        }))
+                        await websocket.send(json.dumps({"action": "error", "message": "Room already exists"}))
 
                 elif action == "join":
                     room_code = data["code"]
@@ -167,32 +125,34 @@ async def handle_client(websocket, path):
                                 "action": "joined",
                                 "code": room_code,
                                 "host_name": room.host_name,
-                                "server_url": os.environ.get("SERVER_URL", "wss://localhost:8765"),
                                 "players": 1 + len(room.guests)
                             }))
-                            
-                            # Запускаем relay для гостя
-                            task = asyncio.create_task(relay_game_data(
-                                websocket, room.guest_ws_queues[client_name], False, room_code, client_name
-                            ))
-                            tasks.append(task)
-                        else:
                             await websocket.send(json.dumps({
-                                "action": "error",
-                                "message": "Failed to join room"
+                                "action": "lan_info",
+                                "motd": room.lan_motd,
+                                "port": room.lan_port
                             }))
+                        else:
+                            await websocket.send(json.dumps({"action": "error", "message": "Failed to join room"}))
                     else:
-                        await websocket.send(json.dumps({
-                            "action": "error",
-                            "message": "Room not found"
-                        }))
+                        await websocket.send(json.dumps({"action": "error", "message": "Room not found"}))
 
                 elif action == "list":
-                    rooms = room_manager.list_rooms()
-                    await websocket.send(json.dumps({
-                        "action": "room_list",
-                        "rooms": rooms
-                    }))
+                    await websocket.send(json.dumps({"action": "room_list", "rooms": room_manager.list_rooms()}))
+
+                elif action == "lan_info":
+                    if room and client_type == "host":
+                        room.lan_motd = data.get("motd", "Minecraft Server")
+                        room.lan_port = data.get("port", 25565)
+                        for guest_ws in list(room.guests.values()):
+                            try:
+                                await guest_ws.send(json.dumps({
+                                    "action": "lan_info",
+                                    "motd": room.lan_motd,
+                                    "port": room.lan_port
+                                }))
+                            except:
+                                pass
 
                 elif action == "close":
                     if room_code and client_type == "host":
@@ -204,41 +164,27 @@ async def handle_client(websocket, path):
                         room_manager.remove_guest(room_code, client_name)
                         room = room_manager.get_room(room_code)
                         if room and room.host_ws:
-                            await room.host_ws.send(json.dumps({
-                                "action": "guest_left",
-                                "guest_name": client_name,
-                                "total_players": 1 + len(room.guests)
-                            }))
+                            try:
+                                await room.host_ws.send(json.dumps({
+                                    "action": "guest_left",
+                                    "guest_name": client_name,
+                                    "total_players": 1 + len(room.guests)
+                                }))
+                            except:
+                                pass
                         await websocket.send(json.dumps({"action": "left"}))
 
                 elif action == "ping":
                     await websocket.send(json.dumps({"action": "pong"}))
 
-                elif action == "lan_info":
-                    if room and client_type == "host":
-                        motd = data.get("motd", "Minecraft Server")
-                        port = data.get("port", 25565)
-                        for guest_name, guest_ws in room.guests.items():
-                            try:
-                                await guest_ws.send(json.dumps({
-                                    "action": "lan_info",
-                                    "motd": motd,
-                                    "port": port
-                                }))
-                            except:
-                                pass
-
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"action": "error", "message": "Invalid JSON"}))
             except Exception as e:
                 logger.error(f"Error handling message: {e}")
-                await websocket.send(json.dumps({"action": "error", "message": str(e)}))
 
-    except asyncio.CancelledError:
+    except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        for task in tasks:
-            task.cancel()
         if client_type == "host" and room_code:
             await room_manager.remove_room(room_code)
         elif client_type == "guest" and room_code and client_name:
@@ -258,13 +204,9 @@ async def handle_client(websocket, path):
 async def main():
     port = int(os.environ.get("PORT", 8765))
     host = "0.0.0.0"
-
     logger.info(f"Starting Hiroku WebSocket Relay Server on {host}:{port}")
-    logger.info("All game traffic goes through WebSocket (single port)")
-    logger.info("Works on Render Free Tier")
-
     async with websockets.serve(handle_client, host, port):
-        logger.info("WebSocket server started. Press Ctrl+C to stop.")
+        logger.info("Server started. Press Ctrl+C to stop.")
         try:
             await asyncio.Future()
         except KeyboardInterrupt:
