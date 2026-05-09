@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: hiroku-relay
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: PORT
+        value: 8765
+      - key: SERVER_URL
+        fromService:
+          type: web
+          name: hiroku-relay
+          envVarKey: RENDER_EXTERNAL_URL
