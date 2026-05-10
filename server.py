@@ -7,12 +7,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 import websockets
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
+
+SERVER_FEATURES: Set[str] = {"zlib", "bin-ping"}
+_FEATURE_PATTERN = re.compile(r'^[a-z0-9-]{1,32}$')
 
 @dataclass
 class Room:
@@ -77,28 +81,78 @@ async def handle_client(websocket):
     room_code = None
     client_name = None
     room = None
+    is_v2: bool = False
+    negotiated_features: Set[str] = set()
 
     try:
         async for message in websocket:
             if isinstance(message, bytes):
-                if room and client_type == "host" and room.guests:
-                    for guest_ws in list(room.guests.values()):
+                if is_v2:
+                    if not message:
+                        continue
+                    op = message[0]
+                    if op == 0xFE:
                         try:
-                            await guest_ws.send(message)
-                        except:
+                            await websocket.send(bytes([0xFF]))
+                        except Exception:
                             pass
-                elif room and client_type == "guest" and room.host_ws:
-                    try:
-                        await room.host_ws.send(message)
-                    except:
-                        pass
+                        continue
+                    elif op == 0xFF:
+                        continue
+                    elif op == 0x00 or op == 0x01:
+                        if room and client_type == "host" and room.guests:
+                            for guest_ws in list(room.guests.values()):
+                                try:
+                                    await guest_ws.send(message)
+                                except Exception:
+                                    pass
+                        elif room and client_type == "guest" and room.host_ws:
+                            try:
+                                await room.host_ws.send(message)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            await websocket.close(1003, "unrecognized opcode")
+                        except Exception:
+                            pass
+                        return
+                else:
+                    if room and client_type == "host" and room.guests:
+                        for guest_ws in list(room.guests.values()):
+                            try:
+                                await guest_ws.send(message)
+                            except Exception:
+                                pass
+                    elif room and client_type == "guest" and room.host_ws:
+                        try:
+                            await room.host_ws.send(message)
+                        except Exception:
+                            pass
                 continue
 
             try:
                 data = json.loads(message)
                 action = data.get("action")
 
-                if action == "create":
+                if action == "hello":
+                    raw_features = data.get("features", [])
+                    if not isinstance(raw_features, list):
+                        raw_features = []
+                    valid_client_features = {
+                        f for f in raw_features
+                        if isinstance(f, str) and _FEATURE_PATTERN.match(f)
+                    }
+                    negotiated_features = valid_client_features & SERVER_FEATURES
+                    is_v2 = True
+                    await websocket.send(json.dumps({
+                        "action": "welcome",
+                        "version": 2,
+                        "features": sorted(negotiated_features),
+                    }))
+                    logger.info(f"welcome sent to {websocket.remote_address}: features={list(negotiated_features)}")
+
+                elif action == "create":
                     room_code = data["code"]
                     client_name = data.get("host_name", "Host")
                     client_type = "host"
@@ -205,7 +259,7 @@ async def main():
     port = int(os.environ.get("PORT", 8765))
     host = "0.0.0.0"
     logger.info(f"Starting Hiroku WebSocket Relay Server on {host}:{port}")
-    async with websockets.serve(handle_client, host, port):
+    async with websockets.serve(handle_client, host, port, max_size=1_048_576, origins=None):
         logger.info("Server started. Press Ctrl+C to stop.")
         try:
             await asyncio.Future()
